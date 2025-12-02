@@ -18,10 +18,12 @@ class BillController extends Controller
             'deposit_amount' => 'required|numeric|min:0',
             'note'           => 'nullable|string',
         ]);
-
+        // Nếu deposit_amount và debt_amount đều = 0 → completed
+        if (($bill->deposit_amount ?? 0) == 0 && ($bill->debt_amount ?? 0) == 0) {
+            $bill->status = 'completed';
+        }
         // Update dữ liệu
         $bill->update($validated);
-
         // Load quan hệ
         $bill->load(['customer', 'payments']);
 
@@ -41,12 +43,12 @@ class BillController extends Controller
             ->orderBy('date', 'desc'); // Sắp xếp theo ngày mới nhất
 
         // Lọc theo khách hàng
-        if ($request->customer_id) {
+        if ($request->customer_id && $request->customer_id !== 'all') {
             $query->where('customer_id', $request->customer_id);
         }
 
         // Lọc theo trạng thái
-        if ($request->status) {
+        if ($request->status && $request->status !== 'all') {
             $query->where('status', $request->status);
         }
 
@@ -66,10 +68,12 @@ class BillController extends Controller
         return response()->json([
             'data' => BillResource::collection($bills),
             'pagination' => [
-                'current_page' => $bills->currentPage(),
-                'last_page'    => $bills->lastPage(),
-                'per_page'     => $bills->perPage(),
-                'total'        => $bills->total(),
+                'from'           => $bills->firstItem(),
+                'to'             => $bills->lastItem(),
+                'total'          => $bills->total(),
+                'next_page_url'  => $bills->nextPageUrl(),
+                'prev_page_url'  => $bills->previousPageUrl(),
+                'last_page'      => $bills->lastPage(),
             ]
         ]);
     }

@@ -15,15 +15,15 @@ use Illuminate\Support\Facades\DB;
 
 class OverviewController extends Controller
 {
-    public function getOverviewCustomer(Request $request)
+    public function getOverviewCustomer($customerId, $period)
     {
-        $request->validate([
-            'target_id' => 'required|exists:customers,id',
-            'period'    => 'required|date_format:Y-m',
-        ]);
+        if (!is_numeric($customerId)) {
+            return response()->json(['error' => 'Invalid customer id'], 422);
+        }
 
-        $customerId = $request->target_id;
-        $period     = $request->period; // YYYY-MM
+        if (!preg_match('/^\d{4}-\d{2}$/', $period)) {
+            return response()->json(['error' => 'Invalid period format (Y-m)'], 422);
+        }// YYYY-MM
 
         // Kiểm tra customer tồn tại
         $customer = Customer::find($customerId);
@@ -111,15 +111,17 @@ class OverviewController extends Controller
             'customer' => $customer
         ]);
     }
-    public function getOverviewSupplier(Request $request)
+    public function getOverviewSupplier($supplierId, $period)
     {
-        $request->validate([
-            'target_id' => 'required|exists:suppliers,id',
-            'period'    => 'required|date_format:Y-m',
-        ]);
+        // Validate supplierId
+        if (!is_numeric($supplierId)) {
+            return response()->json(['error' => 'Invalid supplier id'], 422);
+        }
 
-        $supplierId = $request->target_id;
-        $period     = $request->period; // YYYY-MM
+        // Validate period format YYYY-MM
+        if (!preg_match('/^\d{4}-\d{2}$/', $period)) {
+            return response()->json(['error' => 'Invalid period format (Y-m)'], 422);
+        }
 
         // Kiểm tra supplier tồn tại
         $supplier = Supplier::find($supplierId);

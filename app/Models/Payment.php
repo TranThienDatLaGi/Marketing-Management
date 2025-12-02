@@ -11,7 +11,8 @@ class Payment extends Model
         'date',
         'amount',
         'method',
-        'note'
+        'note',
+        'is_deposit'
     ];
 
     public function bill()

@@ -15,11 +15,12 @@ return new class extends Migration
             $table->id();
             $table->foreignId('supplier_id')->constrained('suppliers')->onDelete('cascade');
             $table->foreignId('account_type_id')->constrained('account_types')->onDelete('cascade');
+            $table->date('date')->nullable();
             $table->decimal('money', 15, 2)->default(0);
-            $table->enum('product_type',['legal','illegal'])->default('legal');
+            $table->enum('product_type',['legal','illegal','middle-illegal'])->default('legal');
             $table->decimal('supplier_rate', 10, 2)->default(0);
             $table->decimal('customer_rate', 10, 2)->default(0);
-            $table->string('status')->default('active');
+            $table->enum('status',['active','inactive'])->default('active');
             $table->text('note')->nullable();
             $table->timestamps();
         });
