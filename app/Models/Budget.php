@@ -9,6 +9,7 @@ class Budget extends Model
     protected $fillable = [
         'supplier_id',
         'account_type_id',
+        'date',
         'money',
         'product_type',
         'supplier_rate',
@@ -30,5 +31,15 @@ class Budget extends Model
     public function contracts()
     {
         return $this->hasMany(Contract::class);
+    }
+    protected static function boot()
+    {
+        parent::boot();
+
+        static::creating(function ($model) {
+            if (!$model->date) {
+                $model->date = now()->setTimezone(config('app.timezone'))->toDateString();
+            }
+        });
     }
 }

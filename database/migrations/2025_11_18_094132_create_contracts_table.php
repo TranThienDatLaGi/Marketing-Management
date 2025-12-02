@@ -18,10 +18,10 @@ return new class extends Migration
             $table->foreignId('budget_id')->constrained('budgets')->onDelete('cascade');
 
             // Thêm bill_id (1 Bill - N Contract)
-            $table->foreignId('bill_id')->constrained('bills')->onDelete('cascade');
+            $table->foreignId('bill_id')->nullable()->constrained('bills')->nullOnDelete();;
 
             $table->string('product');
-            $table->enum('product_type', ['legal', 'illegal'])->default('legal');
+            $table->enum('product_type', ['legal', 'illegal', 'middle-illegal'])->default('legal');
             $table->decimal('total_cost', 15, 2)->default(0);
             $table->decimal('supplier_rate', 10, 2)->default(0);
             $table->decimal('customer_rate', 10, 2)->default(0);

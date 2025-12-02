@@ -18,7 +18,7 @@ return new class extends Migration
             $table->string('facebook')->nullable();
             $table->string('phone_number')->nullable();
             $table->string('address')->nullable();
-            $table->enum('product_type', ['legal', 'illegal'])->default('legal');
+            $table->enum('product_type', ['legal', 'illegal', 'middle-illegal'])->default('legal');
             $table->foreignId('account_type_id')->constrained()->onDelete('cascade');
             $table->text('note')->nullable();
             $table->decimal('rate', 10, 2)->default(0);

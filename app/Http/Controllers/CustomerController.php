@@ -26,10 +26,11 @@ class CustomerController extends Controller
             'facebook' => 'nullable|string|max:255',
             'phone_number' => 'nullable|string|max:20',
             'address' => 'nullable|string|max:255',
-            'product_type' => 'nullable|in:legal,illegal', // có default là legal
+            'product_type' => 'nullable|in:legal,illegal,middle-illegal', // có default là legal
             'account_type_id' => 'required|exists:account_types,id',
             'note' => 'nullable|string',
             'rate' => 'nullable|numeric|min:0',
+
         ]);
 
         // Nếu product_type không được gửi, mặc định 'legal'

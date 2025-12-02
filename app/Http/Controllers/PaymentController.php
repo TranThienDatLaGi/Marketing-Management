@@ -18,6 +18,7 @@ class PaymentController extends Controller
             'amount'  => 'required|numeric|min:0',
             'method'  => 'nullable|in:cash,transfer',
             'note'    => 'nullable|string',
+            'is_deposit'=> 'nullable|boolean'
         ]);
 
         // Tìm hóa đơn
@@ -53,6 +54,7 @@ class PaymentController extends Controller
             'amount' => 'sometimes|numeric|min:0',
             'method' => 'nullable|in:cash,transfer',
             'note'   => 'nullable|string',
+            'is_deposit' => 'nullable|boolean'
         ]);
 
         // Lưu giá trị cũ để tính lại debt_amount
@@ -100,7 +102,7 @@ class PaymentController extends Controller
         // Cập nhật trạng thái bill
         if (($bill->deposit_amount ?? 0) == 0 && ($bill->debt_amount ?? 0) == 0) {
             $bill->status = 'completed';
-        } elseif ($bill->debt_amount > 0) {
+        } elseif ($bill->debt_amount > 0 && $bill->deposit_amount==0) {
             $bill->status = 'debt';
         }
 

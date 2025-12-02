@@ -32,17 +32,17 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::apiResource('account-type', AccountTypeController::class);
     Route::apiResource("customer", CustomerController::class);
+    Route::get('/budgets-by-supplier/{supplierId}', [BudgetController::class, 'getBudgetBySupplier']);
     Route::apiResource('supplier', SupplierController::class);
-    Route::get('/budgets/supplier/{supplierId}', [BudgetController::class, 'getBudgetBySupplier']);
     Route::apiResource('budgets', BudgetController::class)->except(['show']);
-
+    Route::get('/budget-contract',[BudgetController::class, 'getBudgetContract']);
     Route::apiResource('contracts', ContractController::class)->only(['store', 'update', 'destroy']);
     Route::get('contracts/filtered', [ContractController::class, 'filteredContract']);
     
     Route::get('/bills/filter', [BillController::class, 'filteredBill']);
     Route::apiResource('bils', BillController::class)->only(['update', 'destroy']);
     
-    Route::get('/bills/{billId}/payments', [PaymentController::class, 'getPaymentByBill']);
+    Route::get('/payments-by-bill/{billId}', [PaymentController::class, 'getPaymentByBill']);
     Route::post('/payments', [PaymentController::class, 'store']);
     Route::put('/payments/{id}', [PaymentController::class, 'update']);
     Route::delete('/payments/{id}', [PaymentController::class, 'destroy']);

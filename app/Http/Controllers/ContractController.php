@@ -9,10 +9,11 @@ use App\Models\Payment;
 use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class ContractController extends Controller
 {
-    
+
     public function store(Request $request)
     {
         $validated = $request->validate([
@@ -20,14 +21,23 @@ class ContractController extends Controller
             'customer_id'   => 'required|exists:customers,id',
             'budget_id'     => 'required|exists:budgets,id',
             'product'       => 'required',
-            'product_type'  => 'required|in:legal,illegal',
+            'product_type'  => 'required|in:legal,illegal,middle-illegal',
             'total_cost'    => 'nullable|numeric',
             'supplier_rate' => 'nullable|numeric',
             'customer_rate' => 'nullable|numeric',
             'note'          => 'nullable|string',
             'customer_paid' => 'nullable|numeric',
         ]);
+        $existing = Contract::where('product', $validated['product'])
+            ->where('customer_id', $validated['customer_id'])
+            ->where('budget_id', $validated['budget_id'])
+            ->first();
 
+        if ($existing) {
+            return response()->json([
+                'message' => 'Hợp đồng cho khách hàng, sản phẩm và ngân sách này đã tồn tại trước đó'
+            ], 400);
+        }
         // Tạo contract mới
         $contract = Contract::create($validated);
         $contract->load(['customer', 'budget.supplier', 'budget.accountType']);
@@ -37,8 +47,10 @@ class ContractController extends Controller
         $customerPaid = $validated['customer_paid'] ?? 0;
 
         // Tìm contract cũ cùng product
-        $existingContract = Contract::where('product', $validated['product'])->first();
-
+        $existingContract = Contract::where('product', $validated['product'])
+            ->where('customer_id', $validated['customer_id'])
+            ->where('id', '!=', $contract->id) // loại contract vừa tạo
+            ->first();
         if ($existingContract) {
             // Lấy bill cũ
             $bill = $existingContract->bill;
@@ -60,7 +72,8 @@ class ContractController extends Controller
                     'date'    => now(),
                     'amount'  => $customerPaid,
                     'method'  => 'transfer',
-                    'note'    => "có cọc.khách đặt cọc {$customerPaid}",
+                    'note'    => "có cọc.Khách đặt cọc {$customerPaid}",
+                    'is_deposit'=>1,
                 ]);
             }
         } else {
@@ -87,6 +100,7 @@ class ContractController extends Controller
                     'amount'  => $customerPaid,
                     'method'  => 'transfer',
                     'note'    => "có cọc.Khách đặt cọc {$customerPaid}",
+                    'is_deposit' => 1,
                 ]);
             }
         }
@@ -106,14 +120,14 @@ class ContractController extends Controller
                 'customer_id'   => 'sometimes|exists:customers,id',
                 'budget_id'     => 'sometimes|exists:budgets,id',
                 'product'       => 'sometimes|string',
-                'product_type'  => 'sometimes|in:legal,illegal',
+                'product_type'  => 'sometimes|in:legal,illegal,middle-illegal',
                 'total_cost'    => 'sometimes|numeric',
                 'supplier_rate' => 'sometimes|numeric',
                 'customer_rate' => 'sometimes|numeric',
                 'note'          => 'nullable|string',
                 'customer_paid' => 'nullable|numeric',
             ]);
-
+            // Log::info("contract ". $contract);
             // Lưu dữ liệu contract cũ để tính toán
             $oldTotal   = $contract->total_cost * $contract->customer_rate;
             $oldBillId  = $contract->bill_id;
@@ -122,8 +136,9 @@ class ContractController extends Controller
 
             // Lấy payment cọc nếu có
             $oldPayment = Payment::where('bill_id', $oldBillId)
-                ->where('note', 'like', '%có cọc. khách đặt cọc%')
+                ->where('is_deposit', 1)
                 ->first();
+
 
             if ($oldPayment) {
                 $oldCustomerPaid = $oldPayment->amount;
@@ -220,6 +235,23 @@ class ContractController extends Controller
              * ======================================================= */
             $bill = Bill::find($oldBillId);
 
+            if (!$bill) {
+                // Tự động tạo bill mới cho contract này
+                $bill = Bill::create([
+                    'date'          => now(),
+                    'customer_id'   => $contract->customer_id,
+                    'total_money'   => 0,
+                    'deposit_amount' => 0,
+                    'debt_amount'   => 0,
+                    'status'        => 'debt',
+                    'note'          => $contract->note,
+                ]);
+
+                $contract->bill_id = $bill->id;
+                $contract->save();
+            }
+
+
             // Tính lại total mới
             $newTotal = ($validated['total_cost'] ?? $contract->total_cost)
                 * ($validated['customer_rate'] ?? $contract->customer_rate);
@@ -306,7 +338,7 @@ class ContractController extends Controller
 
         // 4. Kiểm tra payment có note "có cọc.khách đặt cọc"
         $payment = $bill->payments()
-            ->where('note', 'có cọc.khách đặt cọc')
+            ->where('note', 'có cọc.Khách đặt cọc')
             ->first();
 
         if ($payment) {
@@ -350,22 +382,27 @@ class ContractController extends Controller
             ->orderBy('date', 'desc'); // Sắp xếp theo ngày mới nhất
 
         // Lọc theo customer
-        if ($request->customer_id) {
+        if ($request->customer_id && $request->customer_id !== "all") {
             $query->where('customer_id', $request->customer_id);
         }
 
         // Lọc theo supplier
-        if ($request->supplier_id) {
+        if ($request->supplier_id && $request->supplier_id !== "all") {
             $query->whereHas('budget', function ($q) use ($request) {
                 $q->where('supplier_id', $request->supplier_id);
             });
         }
 
         // Lọc theo account_type
-        if ($request->account_type_id) {
+        if ($request->account_type_id && $request->account_type_id !== "all") {
             $query->whereHas('budget', function ($q) use ($request) {
                 $q->where('account_type_id', $request->account_type_id);
             });
+        }
+
+        // ✅ Lọc theo product_type (legal, illegal, middle-illegal)
+        if ($request->product_type && $request->product_type !== "all") {
+            $query->where('product_type', $request->product_type);
         }
 
         // Lọc theo ngày
@@ -380,17 +417,19 @@ class ContractController extends Controller
         // Phân trang
         $contracts = $query->paginate($request->per_page ?? 15);
 
-        // Trả về dữ liệu với ContractResource
+        // Resource
         $data = ContractResource::collection($contracts);
 
-        // Trả về kèm thông tin phân trang
+        // Trả về JSON
         return response()->json([
             'data' => $data,
             'pagination' => [
-                'current_page' => $contracts->currentPage(),
-                'last_page'    => $contracts->lastPage(),
-                'per_page'     => $contracts->perPage(),
-                'total'        => $contracts->total(),
+                'from'           => $contracts->firstItem(),
+                'to'             => $contracts->lastItem(),
+                'total'          => $contracts->total(),
+                'next_page_url'  => $contracts->nextPageUrl(),
+                'prev_page_url'  => $contracts->previousPageUrl(),
+                'last_page'      => $contracts->lastPage(),
             ]
         ]);
     }
