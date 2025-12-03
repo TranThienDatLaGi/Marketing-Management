@@ -7,6 +7,7 @@ use App\Models\Budget;
 use App\Models\Contract;
 use App\Models\Customer;
 use App\Models\Overview;
+use App\Models\Payment;
 use App\Models\Supplier;
 use Carbon\Carbon;
 use Exception;
@@ -197,25 +198,36 @@ class OverviewController extends Controller
     }
     public function getDashboard($type, $value)
     {
-        // 1) Lấy khoảng thời gian (bao gồm kiểm tra type không hợp lệ)
+        // 1. Lấy khoảng thời gian
         [$from, $to] = $this->resolvePeriod($type, $value);
 
-        // 2) Lấy contract theo thời gian
-        $contracts = Contract::with(['customer', 'budget.accountType'])
+        // 2. Lấy contracts trong khoảng thời gian
+        $contracts = Contract::with(['customer', 'budget.accountType', 'budget.supplier'])
             ->whereBetween('date', [$from, $to])
             ->get();
+
+        // 3. Lấy tất cả bill_id từ contract
+        $billIds = $contracts->pluck('bill_id')->filter()->unique();
+
+        // 4. Lấy tất cả payments của những bill trong khoảng thời gian
+        $received = Payment::whereIn('bill_id', $billIds)
+            ->whereBetween('date', [$from, $to])
+            ->sum('amount');
 
         return response()->json([
             'period'           => compact('from', 'to'),
             'total_contracts'  => $contracts->count() ?? 0,
             'revenue'          => $this->calcRevenue($contracts),
             'profit'           => $this->calcProfit($contracts),
+            'received'         => $received ?? 0,                    // ✔️ mới thêm
             'top_account_type' => $this->topAccountType($contracts),
             'account_types'    => $this->countAccountTypes($contracts),
             'products'         => $this->countProducts($contracts),
             'customers'        => $this->countCustomers($contracts),
+            'suppliers'        => $this->countSuppliers($contracts), // ✔️ mới thêm
         ]);
     }
+
 
     private function resolvePeriod($type, $value)
     {
@@ -316,6 +328,18 @@ class OverviewController extends Controller
             ->map(fn($group) => [
                 'customer_id'   => $group->first()->customer_id ?? null,
                 'customer_name' => $group->first()->customer->name ?? null,
+                'count'         => $group->count() ?? 0,
+            ])->values();
+    }
+    private function countSuppliers($contracts)
+    {
+        if ($contracts->isEmpty()) return [];
+
+        return $contracts
+            ->groupBy(fn($c) => $c->budget->supplier_id ?? null)
+            ->map(fn($group) => [
+                'supplier_id'   => $group->first()->budget->supplier_id ?? null,
+                'supplier_name' => $group->first()->budget->supplier->name ?? null,
                 'count'         => $group->count() ?? 0,
             ])->values();
     }

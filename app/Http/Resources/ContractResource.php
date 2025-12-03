@@ -8,9 +8,6 @@ class ContractResource extends JsonResource
 {
     public function toArray($request)
     {
-        $customer_cost = $this->total_cost * $this->customer_rate;
-        $supplier_cost = $this->total_cost * $this->supplier_rate;
-
         return [
             'id'                => $this->id,
             'date'              => $this->date,
@@ -26,6 +23,7 @@ class ContractResource extends JsonResource
             'supplier_rate'     => $this->supplier_rate,
             'note'              => $this->note,
             'budget_id'         => $this->budget->id ?? null,
+            'customer_actually_paid'=> $this->customer_actually_paid
         ];
     }
 }

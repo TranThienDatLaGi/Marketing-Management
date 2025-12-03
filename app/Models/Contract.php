@@ -17,6 +17,7 @@ class Contract extends Model
         'customer_rate',
         'note',
         'bill_id',
+        'customer_actually_paid'
     ];
 
     public function customer()

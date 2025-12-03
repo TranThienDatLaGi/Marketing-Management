@@ -9,7 +9,6 @@ use App\Models\Payment;
 use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
 
 class ContractController extends Controller
 {
@@ -26,11 +25,15 @@ class ContractController extends Controller
             'supplier_rate' => 'nullable|numeric',
             'customer_rate' => 'nullable|numeric',
             'note'          => 'nullable|string',
-            'customer_paid' => 'nullable|numeric',
+            'customer_actually_paid' => 'nullable|numeric',
         ]);
+
+        // tránh duplicate hợp đồng cùng product - customer - budget
         $existing = Contract::where('product', $validated['product'])
             ->where('customer_id', $validated['customer_id'])
             ->where('budget_id', $validated['budget_id'])
+            ->where('supplier_rate', $validated['supplier_rate'])
+            ->where('customer_rate', $validated['customer_rate'])
             ->first();
 
         if ($existing) {
@@ -38,75 +41,162 @@ class ContractController extends Controller
                 'message' => 'Hợp đồng cho khách hàng, sản phẩm và ngân sách này đã tồn tại trước đó'
             ], 400);
         }
-        // Tạo contract mới
-        $contract = Contract::create($validated);
-        $contract->load(['customer', 'budget.supplier', 'budget.accountType']);
 
-        // Tính tổng tiền contract
-        $contractTotal = ($validated['total_cost'] ?? 0) * ($validated['customer_rate'] ?? 0);
-        $customerPaid = $validated['customer_paid'] ?? 0;
+        // Tạo contract mới (chưa liên kết bill)
+        $contract = null;
+        DB::transaction(function () use ($validated, &$contract) {
 
-        // Tìm contract cũ cùng product
-        $existingContract = Contract::where('product', $validated['product'])
-            ->where('customer_id', $validated['customer_id'])
-            ->where('id', '!=', $contract->id) // loại contract vừa tạo
-            ->first();
-        if ($existingContract) {
-            // Lấy bill cũ
-            $bill = $existingContract->bill;
+            $contract = Contract::create($validated);
+            $contract->load(['customer', 'budget.supplier', 'budget.accountType']);
 
-            // Cập nhật bill
-            $bill->total_money += $contractTotal;
-            $bill->debt_amount += $contractTotal;
+            // Tính tổng tiền contract (theo cách bạn đang dùng)
+            $contractTotal = ($validated['total_cost'] ?? 0) * ($validated['customer_rate'] ?? 0);
+            $customerPaid = $validated['customer_actually_paid'] ?? 0;
 
-            if ($customerPaid > 0) {
-                $bill->deposit_amount += $customerPaid;
-            }
+            // Tìm contract cũ cùng product - customer - budget (loại contract vừa tạo)
+            $existingContract = Contract::where('product', $validated['product'])
+                ->where('customer_id', $validated['customer_id'])
+                ->where('budget_id', $validated['budget_id'])
+                ->where('id', '!=', $contract->id)
+                ->first();
 
-            $bill->save();
+            // helper cập nhật status dựa trên debt_amount & deposit_amount
+            $updateStatus = function ($bill) {
+                if (bccomp($bill->debt_amount, 0, 2) == 0 && bccomp($bill->deposit_amount, 0, 2) == 0) {
+                    $bill->status = 'completed';
+                } elseif (bccomp($bill->debt_amount, 0, 2) == 0 && bccomp($bill->deposit_amount, 0, 2) == 1) {
+                    $bill->status = 'deposit';
+                } elseif (bccomp($bill->debt_amount, 0, 2) == 1 && bccomp($bill->deposit_amount, 0, 2) == 0) {
+                    $bill->status = 'debt';
+                } else {
+                    // Trường hợp cả hai > 0 (ít khi xảy ra với logic này) — chọn 'deposit' làm ưu tiên.
+                    $bill->status = 'deposit';
+                }
+            };
 
-            // Nếu có customer_paid, tạo payment
-            if ($customerPaid > 0) {
-                Payment::create([
-                    'bill_id' => $bill->id,
-                    'date'    => now(),
-                    'amount'  => $customerPaid,
-                    'method'  => 'transfer',
-                    'note'    => "có cọc.Khách đặt cọc {$customerPaid}",
-                    'is_deposit'=>1,
+            if ($existingContract) {
+                // Lấy bill cũ từ existingContract
+                $bill = $existingContract->bill;
+
+                // Nếu không có bill (không lường trước) thì tạo bill mới thay thế
+                if (!$bill) {
+                    $bill = Bill::create([
+                        'date' => now(),
+                        'customer_id' => $validated['customer_id'],
+                        'total_money' => 0,
+                        'debt_amount' => 0,
+                        'deposit_amount' => 0,
+                        'note' => $validated['note'] ?? null,
+                        'status' => 'debt',
+                    ]);
+                }
+
+                // Cộng tổng hợp đồng mới vào bill tổng
+                $bill->total_money = bcadd($bill->total_money, $contractTotal, 2);
+
+                // Khi thêm contract mới, ban đầu ta thêm nợ tương ứng vào debt_amount
+                $bill->debt_amount = bcadd($bill->debt_amount, $contractTotal, 2);
+
+                // Nếu có tiền khách trả cho contract này, áp dụng vào bill
+                if ($customerPaid > 0) {
+                    // Nếu có nợ > 0 thì customerPaid sẽ trừ vào nợ trước
+                    if (bccomp($bill->debt_amount, 0, 2) == 1) {
+                        // Lưu giá trị nợ trước khi trừ (đã chứa contractTotal)
+                        $currentDebt = $bill->debt_amount;
+
+                        if (bccomp($customerPaid, $currentDebt, 2) >= 0) {
+                            // Khách trả đủ hoặc dư hơn nợ
+                            $left = bcsub($customerPaid, $currentDebt, 2);
+                            $bill->debt_amount = 0;
+                            // deposit_amount tăng thêm phần dư (nếu left > 0)
+                            $bill->deposit_amount = bcadd($bill->deposit_amount, $left, 2);
+                        } else {
+                            // Khách trả chưa đủ, giảm debt
+                            $bill->debt_amount = bcsub($currentDebt, $customerPaid, 2);
+                            // deposit giữ nguyên
+                        }
+                    } else {
+                        // Nếu debt = 0 thì tiền trả là deposit
+                        $bill->deposit_amount = bcadd($bill->deposit_amount, $customerPaid, 2);
+                    }
+
+                    // tạo payment ghi nhận customerPaid (lưu nguyên số đã nộp)
+                    Payment::create([
+                        'bill_id' => $bill->id,
+                        'date'    => now(),
+                        'amount'  => $customerPaid,
+                        'method'  => 'transfer',
+                        'note'    => "có cọc. Khách đặt cọc {$customerPaid}",
+                        'is_deposit' => 1,
+                    ]);
+                }
+
+                // Cập nhật status theo quy tắc
+                $updateStatus($bill);
+                $bill->save();
+
+                // Liên kết contract mới với bill cũ
+                $contract->bill_id = $bill->id;
+                $contract->save();
+            } else {
+                // Không có existingContract -> tạo bill mới
+                $bill = Bill::create([
+                    'date'          => now(),
+                    'customer_id'   => $validated['customer_id'],
+                    'total_money'   => $contractTotal,
+                    // debt & deposit sẽ gán phía dưới tuỳ customerPaid
+                    'debt_amount'   => 0,
+                    'deposit_amount' => 0,
+                    'note'          => $validated['note'] ?? null,
+                    'status'        => 'debt',
                 ]);
-            }
-        } else {
-            // Tạo bill mới
-            $bill = Bill::create([
-                'date'          => now(),
-                'customer_id'   => $validated['customer_id'],
-                'total_money'   => $contractTotal,
-                'debt_amount'   => $contractTotal,
-                'deposit_amount' => $customerPaid,
-                'note'          => $validated['note'] ?? null,
-                'status'        => $customerPaid > 0 ? 'deposit' : 'debt',
-            ]);
 
-            // Liên kết contract với bill mới
-            $contract->bill_id = $bill->id;
-            $contract->save();
+                // Xử lý customerPaid so với total_money
+                if ($customerPaid > 0) {
+                    $diff = bcsub($customerPaid, $bill->total_money, 2); // customerPaid - total_money
 
-            // Nếu có customer_paid, tạo payment
-            if ($customerPaid > 0) {
-                Payment::create([
-                    'bill_id' => $bill->id,
-                    'date'    => now(),
-                    'amount'  => $customerPaid,
-                    'method'  => 'transfer',
-                    'note'    => "có cọc.Khách đặt cọc {$customerPaid}",
-                    'is_deposit' => 1,
-                ]);
+                    if (bccomp($diff, 0, 2) == 1) {
+                        // customerPaid > total_money => debt = 0, deposit = diff
+                        $bill->debt_amount = 0;
+                        $bill->deposit_amount = $diff;
+                    } elseif (bccomp($diff, 0, 2) == -1) {
+                        // customerPaid < total_money => debt = total_money - customerPaid, deposit = 0
+                        $bill->debt_amount = bcsub($bill->total_money, $customerPaid, 2);
+                        $bill->deposit_amount = 0;
+                    } else {
+                        // bằng 0
+                        $bill->debt_amount = 0;
+                        $bill->deposit_amount = 0;
+                    }
+
+                    // tạo payment lưu customerPaid
+                    Payment::create([
+                        'bill_id' => $bill->id,
+                        'date'    => now(),
+                        'amount'  => $customerPaid,
+                        'method'  => 'transfer',
+                        'note'    => "có cọc. Khách đặt cọc {$customerPaid}",
+                        'is_deposit' => 1,
+                    ]);
+                } else {
+                    // không có thanh toán trước
+                    $bill->debt_amount = $bill->total_money;
+                    $bill->deposit_amount = 0;
+                }
+
+                // cập nhật status
+                $updateStatus($bill);
+                $bill->save();
+
+                // Liên kết contract với bill mới
+                $contract->bill_id = $bill->id;
+                $contract->save();
             }
-        }
+        });
 
         return new ContractResource($contract);
     }
+
 
     public function update(Request $request, $id)
     {
@@ -125,189 +215,254 @@ class ContractController extends Controller
                 'supplier_rate' => 'sometimes|numeric',
                 'customer_rate' => 'sometimes|numeric',
                 'note'          => 'nullable|string',
-                'customer_paid' => 'nullable|numeric',
+                'customer_actually_paid' => 'nullable|numeric',
             ]);
-            // Log::info("contract ". $contract);
-            // Lưu dữ liệu contract cũ để tính toán
-            $oldTotal   = $contract->total_cost * $contract->customer_rate;
-            $oldBillId  = $contract->bill_id;
 
-            $oldCustomerPaid = 0;
+            /** Lấy dữ liệu cũ */
+            $oldTotal = $contract->total_cost * $contract->customer_rate;
+            $oldBillId = $contract->bill_id;
 
-            // Lấy payment cọc nếu có
             $oldPayment = Payment::where('bill_id', $oldBillId)
                 ->where('is_deposit', 1)
                 ->first();
+            $oldCustomerPaid = $oldPayment->amount ?? 0;
 
-
-            if ($oldPayment) {
-                $oldCustomerPaid = $oldPayment->amount;
-            }
-
-            /** ==========================================
-             * 1. XÁC ĐỊNH contract có đổi “nhóm bill” ko?
-             * ========================================= */
+            /** Kiểm tra đổi nhóm bill hay không */
             $isChangedGroup =
-                (isset($validated['customer_id']) && $validated['customer_id'] != $contract->customer_id)
-                || (isset($validated['budget_id']) && $validated['budget_id'] != $contract->budget_id)
-                || (isset($validated['product']) && $validated['product'] != $contract->product);
+                (isset($validated['customer_id']) && $validated['customer_id'] != $contract->customer_id) ||
+                (isset($validated['budget_id']) && $validated['budget_id'] != $contract->budget_id) ||
+                (isset($validated['product']) && $validated['product'] != $contract->product);
 
-            /** =======================================================
-             * TRƯỜNG HỢP A: CONTRACT ĐỔI customer_id / budget_id / product
-             * ======================================================= */
+            /** Helper cập nhật trạng thái bill */
+            $updateStatus = function ($bill) {
+                if ($bill->debt_amount == 0 && $bill->deposit_amount == 0) {
+                    $bill->status = 'completed';
+                } elseif ($bill->debt_amount == 0 && $bill->deposit_amount > 0) {
+                    $bill->status = 'deposit';
+                } elseif ($bill->debt_amount > 0 && $bill->deposit_amount == 0) {
+                    $bill->status = 'debt';
+                } else {
+                    $bill->status = 'deposit';
+                }
+            };
+
+            /** ============================================================
+             * A. CONTRACT ĐỔI NHÓM BILL → TÁCH BILL CŨ, TẠO BILL MỚI
+             * ============================================================ */
             if ($isChangedGroup) {
 
-                /** --------------------------
-                 * A1. XỬ LÝ BILL CŨ
-                 * -------------------------- */
-
+                /** 1. CẬP NHẬT BILL CŨ */
                 $bill = Bill::find($oldBillId);
 
-                // Trừ total_money & debt_amount
-                $bill->total_money -= $oldTotal;
-                $bill->debt_amount -= $oldTotal;
+                if ($bill) {
+                    // trừ tiền contract cũ
+                    $bill->total_money -= $oldTotal;
+                    $bill->debt_amount -= $oldTotal;
 
-                // Trừ tiền đặt cọc cũ (nếu có)
-                if ($oldCustomerPaid > 0) {
-                    $bill->deposit_amount -= $oldCustomerPaid;
+                    // trừ cọc cũ
+                    if ($oldCustomerPaid > 0) {
+                        $bill->deposit_amount -= $oldCustomerPaid;
+                    }
+
+                    $updateStatus($bill);
+                    $bill->save();
+
+                    // xoá payment cũ (đã lấy amount ở trên)
+                    if ($oldPayment) {
+                        $oldPayment->delete();
+                    }
+
+                    // IMPORTANT: để tránh cascade delete (contracts -> bill onDelete cascade),
+                    // ta phải **ngắt liên kết contract khỏi bill cũ** trước khi xóa bill.
+                    // Gán bill_id = null rồi save để controller tiếp theo có thể tạo bill mới và gán lại.
+                    $contract->bill_id = null;
+                    $contract->save();
+
+                    // nếu bill không còn contract → xoá luôn bill
+                    $other = Contract::where('bill_id', $oldBillId)
+                        ->where('id', '!=', $contract->id)
+                        ->exists();
+
+                    if (!$other) {
+                        // xoá mọi payment còn lại (nếu có)
+                        Payment::where('bill_id', $oldBillId)->delete();
+                        $bill->delete();
+                    }
                 }
 
-                $bill->save();
+                /** 2. TẠO BILL MỚI (như store) */
+                $newTotal = ($validated['total_cost'] ?? $contract->total_cost) *
+                    ($validated['customer_rate'] ?? $contract->customer_rate);
 
-                // Xóa payment đặt cọc cũ
-                if ($oldPayment) {
-                    $oldPayment->delete();
-                }
+                $newPaid = $validated['customer_actually_paid'] ?? 0;
 
-                // Kiểm tra còn contract nào khác trong bill không
-                $other = Contract::where('bill_id', $oldBillId)
-                    ->where('id', '!=', $contract->id)
-                    ->exists();
-
-                if (!$other) {
-                    // Xóa toàn bộ payment và bill
-                    Payment::where('bill_id', $oldBillId)->delete();
-                    $bill->delete();
-                }
-
-                /** --------------------------
-                 * A2. TẠO BILL MỚI (logic giống store)
-                 * -------------------------- */
-
-                $contractTotal = ($validated['total_cost'] ?? $contract->total_cost)
-                    * ($validated['customer_rate'] ?? $contract->customer_rate);
-
-                $newCustomerPaid = $validated['customer_paid'] ?? 0;
-
+                // bill mới
                 $newBill = Bill::create([
-                    'date'          => now(),
-                    'customer_id'   => $validated['customer_id'] ?? $contract->customer_id,
-                    'total_money'   => $contractTotal,
-                    'debt_amount'   => $contractTotal,
-                    'deposit_amount' => $newCustomerPaid,
-                    'note'          => $validated['note'] ?? $contract->note,
-                    'status'        => $newCustomerPaid > 0 ? 'deposit' : 'debt',
+                    'date'        => now(),
+                    'customer_id' => $validated['customer_id'] ?? $contract->customer_id,
+                    'total_money' => $newTotal,
+                    'note'        => $validated['note'] ?? $contract->note,
+                    'debt_amount' => 0,
+                    'deposit_amount' => 0,
                 ]);
 
-                // Gán contract vào bill mới
-                $validated['bill_id'] = $newBill->id;
+                /** Áp logic tiền như store() */
+                if ($newPaid > 0) {
+                    $diff = $newPaid - $newTotal;
 
-                // Nếu có cọc → tạo payment
-                if ($newCustomerPaid > 0) {
+                    if ($diff > 0) {
+                        $newBill->debt_amount = 0;
+                        $newBill->deposit_amount = $diff;
+                    } elseif ($diff < 0) {
+                        $newBill->debt_amount = $newTotal - $newPaid;
+                        $newBill->deposit_amount = 0;
+                    } else {
+                        $newBill->debt_amount = 0;
+                        $newBill->deposit_amount = 0;
+                    }
+                } else {
+                    // không trả trước → toàn bộ thành debt
+                    $newBill->debt_amount = $newTotal;
+                }
+
+                $updateStatus($newBill);
+                $newBill->save();
+
+                /** Tạo payment */
+                if ($newPaid > 0) {
                     Payment::create([
                         'bill_id' => $newBill->id,
-                        'date'    => now(),
-                        'amount'  => $newCustomerPaid,
-                        'method'  => 'transfer',
-                        'note'    => "có cọc. khách đặt cọc {$newCustomerPaid}",
+                        'date' => now(),
+                        'amount' => $newPaid,
+                        'note' => "có cọc. Khách đặt cọc {$newPaid}",
+                        'is_deposit' => 1
                     ]);
                 }
 
-                // Cập nhật contract
+                /** Gán bill mới vào contract */
+                $validated['bill_id'] = $newBill->id;
                 $contract->update($validated);
 
                 DB::commit();
                 return new ContractResource($contract);
             }
 
-            /** =======================================================
-             * TRƯỜNG HỢP B: KHÔNG ĐỔI nhóm bill → chỉ cập nhật bill hiện tại
-             * ======================================================= */
+            /** ============================================================
+             * B. KHÔNG ĐỔI NHÓM BILL → CHỈ CẬP NHẬT CONTRACT & BILL CŨ
+             * ============================================================ */
             $bill = Bill::find($oldBillId);
 
             if (!$bill) {
-                // Tự động tạo bill mới cho contract này
+                // hiếm khi xảy ra → tạo bill mới
                 $bill = Bill::create([
-                    'date'          => now(),
-                    'customer_id'   => $contract->customer_id,
-                    'total_money'   => 0,
+                    'date' => now(),
+                    'customer_id' => $contract->customer_id,
+                    'total_money' => 0,
+                    'debt_amount' => 0,
                     'deposit_amount' => 0,
-                    'debt_amount'   => 0,
-                    'status'        => 'debt',
-                    'note'          => $contract->note,
+                    'status' => 'debt',
                 ]);
-
                 $contract->bill_id = $bill->id;
                 $contract->save();
             }
 
+            /** Tính total mới */
+            $newTotal = ($validated['total_cost'] ?? $contract->total_cost) *
+                ($validated['customer_rate'] ?? $contract->customer_rate);
 
-            // Tính lại total mới
-            $newTotal = ($validated['total_cost'] ?? $contract->total_cost)
-                * ($validated['customer_rate'] ?? $contract->customer_rate);
-
-            // Cập nhật bill: trừ old + cộng new
+            /** Cập nhật total bill (trừ old, cộng new) */
             $bill->total_money = $bill->total_money - $oldTotal + $newTotal;
-            $bill->debt_amount = $bill->debt_amount - $oldTotal + $newTotal;
 
-            // Trừ tiền cọc cũ
-            if ($oldCustomerPaid > 0) {
-                $bill->deposit_amount -= $oldCustomerPaid;
+            /**
+             * Thay vì: $bill->debt_amount -= $oldTotal;
+             * và $bill->deposit_amount -= $oldCustomerPaid;
+             *
+             * Ta dùng logic an toàn: lấy giá trị gốc từ bill, trừ oldTotal vào debt trước,
+             * nếu debt không đủ thì phần dư trừ vào deposit.
+             */
+            $originalDebt = $bill->debt_amount;
+            $originalDeposit = $bill->deposit_amount;
+
+            // Remove oldTotal from bill: reduce debt first, then deposit if cần
+            if ($originalDebt >= $oldTotal) {
+                $bill->debt_amount = $originalDebt - $oldTotal;
+                // deposit giữ nguyên
+                $bill->deposit_amount = $originalDeposit;
+            } else {
+                // debt không đủ → debt becomes 0, phần dư trừ vào deposit
+                $remaining = $oldTotal - $originalDebt; // phần phải trừ từ deposit
+                $bill->debt_amount = 0;
+                $bill->deposit_amount = max(0, $originalDeposit - $remaining);
             }
 
-            // Nếu người dùng gửi customer_paid mới → cập nhật lại
-            $newPaid = $validated['customer_paid'] ?? 0;
+            /**
+             * Bây giờ áp dụng customer_actually_paid mới (newPaid).
+             * Ý tưởng: newPaid là số tiền khách báo đã trả cho hợp đồng này (cọc).
+             * Ta cần cập nhật payment tương ứng (create/update/delete) và cập nhật debt/deposit dựa trên newTotal và tổng newPaid.
+             */
+            $newPaid = $validated['customer_actually_paid'] ?? null;
 
-            if ($newPaid > 0) {
-                $bill->deposit_amount += $newPaid;
+            if ($newPaid !== null && $newPaid > 0) {
+                // Ta sẽ tính lại dựa trên newTotal và newPaid (không dùng oldPayment trực tiếp để trừ nữa)
+                $diff = $newPaid - $newTotal;
 
-                // Update payment cũ hoặc tạo mới
+                if ($diff > 0) {
+                    // trả nhiều hơn -> không nợ, phần thừa thành deposit (lưu vào bill->deposit_amount)
+                    $bill->debt_amount = 0;
+                    // deposit có thể cộng thêm phần thừa
+                    // Lưu ý: hiện tại bill->deposit_amount là giá trị sau khi đã trừ oldTotal,
+                    // nên ta cộng thêm phần thừa newDiff
+                    $bill->deposit_amount = ($bill->deposit_amount ?? 0) + $diff;
+                } elseif ($diff < 0) {
+                    // trả ít -> còn nợ
+                    $bill->debt_amount = abs($diff); // newTotal - newPaid
+                    $bill->deposit_amount = 0;
+                } else {
+                    // bằng đúng
+                    $bill->debt_amount = 0;
+                    $bill->deposit_amount = 0;
+                }
+
+                // cập nhật hoặc tạo payment is_deposit
                 if ($oldPayment) {
+                    // nếu đã có payment cũ thì update amount (ghi chú)
                     $oldPayment->amount = $newPaid;
-                    $oldPayment->note   = "có cọc. khách cọc {$newPaid}";
+                    $oldPayment->note = "có cọc. Khách đặt cọc {$newPaid}";
+                    $oldPayment->date = now();
                     $oldPayment->save();
                 } else {
+                    // tạo payment mới
                     Payment::create([
                         'bill_id' => $bill->id,
-                        'date'    => now(),
-                        'amount'  => $newPaid,
-                        'method'  => 'transfer',
-                        'note'    => "có cọc. khách cọc {$newPaid}",
+                        'date' => now(),
+                        'amount' => $newPaid,
+                        'note' => "có cọc. Khách đặt cọc {$newPaid}",
+                        'is_deposit' => 1
                     ]);
                 }
             } else {
-                // Xóa payment nếu newPaid = 0
-                if ($oldPayment) $oldPayment->delete();
-            }
-            if ($bill->deposit_amount > 0) {
-                $bill->status = 'deposit';
-            } else {
-                if ($bill->debt_amount <= 0) {
-                    $bill->status = 'completed';
-                } else {
-                    $bill->status = 'debt';
+                // newPaid === null hoặc 0 => khách không trả cọc mới cho hợp đồng này
+                // Ta đặt debt = newTotal (toàn bộ thành nợ) và giữ/ xoá payment cũ
+                $bill->debt_amount = $newTotal;
+                $bill->deposit_amount = 0;
+
+                if ($oldPayment) {
+                    $oldPayment->delete();
                 }
             }
+
+            /** Cập nhật trạng thái bill */
+            $updateStatus($bill);
             $bill->save();
 
-            /** ------------------
-             * Cập nhật contract
-             * ------------------ */
+            /** Cập nhật contract */
             $contract->update($validated);
+
 
             DB::commit();
             $contract->refresh();
             $contract->load(['customer', 'budget.supplier', 'budget.accountType']);
+
             return new ContractResource($contract);
         } catch (Exception $e) {
             DB::rollBack();
@@ -315,64 +470,82 @@ class ContractController extends Controller
         }
     }
 
+
+
     public function destroy($id)
     {
-        // 1. Lấy contract
-        $contract = Contract::findOrFail($id);
-        $bill = $contract->bill;
+        DB::beginTransaction();
 
-        if (!$bill) {
-            return response()->json(['message' => 'Bill not found'], 404);
-        }
+        try {
+            // 1. Lấy contract
+            $contract = Contract::findOrFail($id);
+            $bill = $contract->bill;
 
-        // 2. Tính số tiền cần trừ (tổng doanh thu contract đóng góp vào bill)
-        $subtractMoney = $contract->total_cost * $contract->customer_rate;
+            if (!$bill) {
+                return response()->json(['message' => 'Bill not found'], 404);
+            }
 
-        // 3. Cập nhật bill: total_money & debt_amount
-        $bill->total_money -= $subtractMoney;
-        $bill->debt_amount -= $subtractMoney;
+            // 2. Tính tiền doanh thu cần trừ
+            $subtractMoney = $contract->total_cost * $contract->customer_rate;
 
-        // Không để âm
-        $bill->total_money = max(0, $bill->total_money);
-        $bill->debt_amount = max(0, $bill->debt_amount);
+            // 3. Lấy payment cọc (nếu có) → theo is_deposit
+            $depositPayment = Payment::where('bill_id', $bill->id)
+                ->where('is_deposit', 1)
+                ->first();
 
-        // 4. Kiểm tra payment có note "có cọc.khách đặt cọc"
-        $payment = $bill->payments()
-            ->where('note', 'có cọc.Khách đặt cọc')
-            ->first();
+            $oldCustomerPaid = $depositPayment ? $depositPayment->amount : 0;
 
-        if ($payment) {
-            // Trừ tiền cọc
-            $bill->deposit_amount -= $payment->amount;
-            $bill->deposit_amount = max(0, $bill->deposit_amount);
+            // =======================================
+            // 4. Cập nhật bill
+            // =======================================
+            $bill->total_money -= $subtractMoney;
+            $bill->debt_amount -= $subtractMoney;
 
-            // Xóa payment
-            $payment->delete();
-        }
+            // Không âm
+            $bill->total_money = max(0, $bill->total_money);
+            $bill->debt_amount = max(0, $bill->debt_amount);
 
-        // 5. Cập nhật status của bill
-        if ($bill->deposit_amount > 0) {
-            $bill->status = 'deposit';
-        } else {
-            if ($bill->debt_amount == 0) {
+            // Trừ tiền cọc nếu có
+            if ($oldCustomerPaid > 0) {
+                $bill->deposit_amount -= $oldCustomerPaid;
+                $bill->deposit_amount = max(0, $bill->deposit_amount);
+            }
+
+            // Xóa payment cọc
+            if ($depositPayment) {
+                $depositPayment->delete();
+            }
+
+            // Cập nhật lại status bill
+            if ($bill->deposit_amount > 0) {
+                $bill->status = 'deposit';
+            } else if ($bill->debt_amount <= 0) {
                 $bill->status = 'completed';
             } else {
                 $bill->status = 'debt';
             }
+
+            $bill->save();
+
+            // =======================================
+            // 5. Xóa contract
+            // =======================================
+            $contract->delete();
+
+            // =======================================
+            // 6. Nếu bill không còn contract → xóa luôn bill
+            // =======================================
+            if ($bill->contracts()->count() == 0) {
+                Payment::where('bill_id', $bill->id)->delete(); // xoá mọi payment còn sót
+                $bill->delete();
+            }
+
+            DB::commit();
+            return response()->json(['message' => 'Deleted successfully']);
+        } catch (Exception $e) {
+            DB::rollBack();
+            throw $e;
         }
-
-        // 6. Lưu bill
-        $bill->save();
-
-        // 7. Xóa contract
-        $contract->delete();
-
-        // 8. Nếu bill không còn contract → xóa bill
-        if ($bill->contracts()->count() == 0) {
-            $bill->delete();
-        }
-
-        return response()->json(['message' => 'Deleted successfully']);
     }
 
     public function filteredContract(Request $request)
